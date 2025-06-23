@@ -1,0 +1,565 @@
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "TRSensors.h"
+#include <Wire.h>
+
+#define PWMA   6           //Left Motor Speed pin (ENA)
+#define AIN2   A0          //Motor-L forward (IN2).
+#define AIN1   A1          //Motor-L backward (IN1)
+#define PWMB   5           //Right Motor Speed pin (ENB)
+#define BIN1   A2          //Motor-R forward (IN3)
+#define BIN2   A3          //Motor-R backward (IN4)
+#define PIN 7
+#define NUM_SENSORS 5
+#define OLED_RESET 9
+#define OLED_SA0   8
+#define Addr  0x20
+
+// Virtual compass constants
+#define TRACK_WIDTH 0.098f    // Distance between wheels in meters (adjust for your robot)
+#define PI 3.14159265359f
+
+Adafruit_SSD1306 display(OLED_RESET, OLED_SA0);
+
+TRSensors trs =   TRSensors();
+unsigned int sensorValues[NUM_SENSORS];
+unsigned int position;
+uint16_t i, j;
+byte value;
+unsigned long lasttime = 0;
+unsigned long last_compass_update = 0;
+Adafruit_NeoPixel RGB = Adafruit_NeoPixel(4, PIN, NEO_GRB + NEO_KHZ800);
+
+void PCF8574Write(byte data);
+byte PCF8574Read();
+uint32_t Wheel(byte WheelPos);
+
+unsigned char found_exit = 0;
+
+// Virtual compass variables
+static float total_rotation = 0.0f;      // Total rotation in radians since start
+static float current_heading = 0.0f;     // Current heading in radians (0 = initial direction)
+static int last_left_pwm = 0;           // For tracking PWM changes
+static int last_right_pwm = 0;
+
+// Pledge's algorithm variables
+static float pledge_counter = 0;           // Counter for Pledge's algorithm
+static int initial_direction = 0;        // 0=North, 1=East, 2=South, 3=West
+
+/**
+ * Converts PWM value to approximate motor speed in cm/s
+ * Based on linear interpolation of measured data points:
+ * 60 PWM ~ 1.1 km/h, 70 PWM ~ 1.3 km/h, 80 PWM ~ 1.5 km/h,
+ * 90 PWM ~ 1.8 km/h, 100 PWM ~ 2.0 km/h
+ */
+float pwm_to_speed_cms(int pwm) {
+    // Handle negative PWM (reverse direction)
+    int abs_pwm = abs(pwm);
+    
+    // Linear approximation: speed_kmh = 0.0225 * pwm - 0.25
+    float speed_kmh = 0.0225f * abs_pwm - 0.25f;
+    
+    // Convert km/h to cm/s: multiply by 27.778
+    float speed_cms = speed_kmh * 27.778f;
+    
+    // Ensure non-negative speed
+    if (speed_cms < 0) {
+        speed_cms = 0;
+    }
+    
+    // Apply direction
+    return (pwm >= 0) ? speed_cms : -speed_cms;
+}
+
+/**
+ * Update virtual compass based on motor PWM values
+ */
+void update_compass(int left_pwm, int right_pwm) {
+  unsigned long current_time = millis();
+  if (last_compass_update == 0) {
+    last_compass_update = current_time;
+    last_left_pwm = left_pwm;
+    last_right_pwm = right_pwm;
+    return;
+  }
+  
+  float dt = (current_time - last_compass_update) / 1000.0f; // Convert to seconds
+  
+  if (dt > 0.001f) { // Only update if enough time has passed
+    // Convert PWM to actual speeds in cm/s
+    float left_speed = pwm_to_speed_cms(left_pwm);
+    float right_speed = pwm_to_speed_cms(right_pwm);
+    
+    // Calculate speed difference for rotation (right - left for clockwise positive)
+    float speed_diff = right_speed - left_speed;
+    
+    // Calculate angular velocity (radians per second)
+    // Angular velocity = linear speed difference / track width
+    float angular_velocity = speed_diff / TRACK_WIDTH;
+    
+    // Calculate rotation for this time step
+    float rotation_increment = angular_velocity * dt;
+    
+    // Accumulate total rotation
+    total_rotation += rotation_increment;
+    current_heading = total_rotation;
+    
+    // Normalize heading to -PI to PI range
+    while (current_heading > PI) current_heading -= 2 * PI;
+    while (current_heading < -PI) current_heading += 2 * PI;
+    
+    last_compass_update = current_time;
+  }
+  
+  last_left_pwm = left_pwm;
+  last_right_pwm = right_pwm;
+}
+
+/**
+ * Get current compass direction (0=North, 1=East, 2=South, 3=West)
+ */
+int get_compass_direction() {
+  // Convert radians to cardinal directions
+  float degreesfl = current_heading * 180.0f / PI; 
+  int degrees = (int)degreesfl;
+  
+  // Normalize to 0-360 range
+  //while (degrees < 0) degrees += 360;
+  //while (degrees >= 360) degrees -= 360;
+  
+  // Convert to cardinal directions with 45-degree tolerance
+  if (abs(degrees % 360) >= 315 || abs(degrees % 360) < 45) return 0;      // North
+  else if (abs(degrees % 360) >= 45 && abs(degrees % 360) < 135) return 1;  // East  
+  else if (abs(degrees % 360) >= 135 && abs(degrees % 360) < 225) return 2; // South
+  else return 3;                                       // West
+}
+
+/**
+ * Check if robot is facing initial direction
+ */
+bool facing_initial_direction() {
+  return (get_compass_direction() == initial_direction);
+}
+
+/**
+ * Reset compass to current position as "North"
+ */
+void reset_compass() {
+  total_rotation = 0.0f;
+  current_heading = 0.0f;
+  initial_direction = 0; // Current direction is now "North"
+}
+
+/**
+ * Enhanced SetSpeeds with compass update
+ */
+void SetSpeeds(int Aspeed, int Bspeed) {
+  // Update compass before changing speeds
+  update_compass(last_left_pwm, last_right_pwm);
+  
+  if(Aspeed < 0) {
+    digitalWrite(AIN1,HIGH);
+    digitalWrite(AIN2,LOW);
+    analogWrite(PWMA,-Aspeed);      
+  } else {
+    digitalWrite(AIN1,LOW); 
+    digitalWrite(AIN2,HIGH);
+    analogWrite(PWMA,Aspeed);  
+  }
+  
+  if(Bspeed < 0) {
+    digitalWrite(BIN1,HIGH);
+    digitalWrite(BIN2,LOW);
+    analogWrite(PWMB,-Bspeed);      
+  } else {
+    digitalWrite(BIN1,LOW); 
+    digitalWrite(BIN2,HIGH);
+    analogWrite(PWMB,Bspeed);  
+  }
+  
+  // Store current PWM values for next compass update
+  last_left_pwm = Aspeed;
+  last_right_pwm = Bspeed;
+}
+
+void setup() {
+  delay(1000);
+  Serial.begin(115200);
+  Serial.println("TRSensor example with Virtual Compass");
+  Wire.begin();
+  pinMode(PWMA,OUTPUT);                     
+  pinMode(AIN2,OUTPUT);      
+  pinMode(AIN1,OUTPUT);
+  pinMode(PWMB,OUTPUT);       
+  pinMode(AIN1,OUTPUT);     
+  pinMode(AIN2,OUTPUT);  
+  SetSpeeds(0,0);
+  
+  // Initialize compass
+  reset_compass();
+  
+  // by default, we'll generate the high voltage from the 3.3v line internally! (neat!)
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  // initialize with the I2C addr 0x3D (for the 128x64)
+  // init done
+  
+  // Show image buffer on the display hardware.
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(5,0);
+  display.println("TU(Hmawbi)");
+  display.setCursor(5,25);
+  display.println("MazeSolver");
+  display.setTextSize(1);
+  display.setCursor(10,55);
+  display.println("Press to calibrate");
+  display.display();
+  
+  while(value != 0xEF) { //wait button pressed
+    PCF8574Write(0x1F | PCF8574Read());
+    value = PCF8574Read() | 0xE0;
+  }
+  
+  RGB.begin();
+  RGB.setPixelColor(0,0x00FF00 );
+  RGB.setPixelColor(1,0x00FF00 );
+  RGB.setPixelColor(2,0x00FF00 );
+  RGB.setPixelColor(3,0x00FF00);
+  RGB.show(); 
+  delay(500);
+  
+  for (int i = 0; i < 100; i++) { // make the calibration take about 10 seconds
+    if(i<27 || i >= 75) {
+      SetSpeeds(60,-60);
+    } else { 
+      SetSpeeds(-60,60);
+    }
+    trs.calibrate();       // reads all sensors 100 times
+  }
+  SetSpeeds(0,0); 
+  
+  // Reset compass after calibration since robot has been turning
+  reset_compass();
+  
+  RGB.setPixelColor(0,0x0000FF );
+  RGB.setPixelColor(1,0x0000FF );
+  RGB.setPixelColor(2,0x0000FF );
+  RGB.setPixelColor(3,0x0000FF);
+  RGB.show(); // Initialize all pixels to 'off'
+  
+  value = 0;
+  while(value != 0xEF) { //wait button pressed
+    PCF8574Write(0x1F | PCF8574Read());
+    value = PCF8574Read() | 0xE0;
+    position = trs.readLine(sensorValues)/200;
+    display.clearDisplay();
+    display.setCursor(0,25);
+    display.println("Calibration Done !!!");
+    display.setCursor(0,55);
+    for (int i = 0; i < 21; i++) {
+      display.print('_');
+    }
+    display.setCursor(position*6,55);
+    display.print("**");
+    display.display();
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(10,0);
+  display.println("AlhpaBot2");
+  display.setTextSize(3);
+  display.setCursor(40,30);
+  display.println("Go!");
+  display.display();
+  delay(500);
+}
+
+void follow_segment() {
+  int last_proportional = 0;
+  long integral=0;
+
+  while(1) {
+    // Get the position of the line.
+    unsigned int position = trs.readLine(sensorValues);
+
+    // The "proportional" term should be 0 when we are on the line.
+    int proportional = ((int)position) - 2000;
+
+    // Compute the derivative (change) and integral (sum) of the position.
+    int derivative = proportional - last_proportional;
+    integral += proportional;
+
+    // Remember the last position.
+    last_proportional = proportional;
+
+    // Compute the difference between the two motor power settings
+    int power_difference = proportional/40 + integral*0 + derivative/1;
+    //proportional/20 + integral/10000 + derivative*10
+    //proportional/1 + integral*0 + derivative*80;
+    //proportional/40 + integral*0 + derivative/1
+
+    // Compute the actual motor settings.
+    const int maximum = 65; // the maximum speed
+    if (power_difference > maximum)
+      power_difference = maximum;
+    if (power_difference < -maximum)
+      power_difference = - maximum;
+
+    if (power_difference < 0) {
+      //SetSpeeds(maximum + power_difference, maximum);
+      analogWrite(PWMA,maximum + power_difference);
+      analogWrite(PWMB,maximum);
+      update_compass(maximum + power_difference, maximum);
+    } else {
+      //SetSpeeds(maximum, maximum - power_difference);
+      analogWrite(PWMA,maximum);
+      analogWrite(PWMB,maximum - power_difference);
+      update_compass(maximum, maximum - power_difference);
+    }
+
+    // Check for intersections and dead ends
+    if(millis() - lasttime > 100) {
+      if (sensorValues[1] < 150 && sensorValues[2] < 150 && sensorValues[3] < 150) {
+        // There is no line visible ahead - dead end
+        return;
+      } else if (sensorValues[0] > 600 || sensorValues[4] > 600) {
+        // Found an intersection
+        return;
+      }
+    }
+  }
+}
+
+void recover_from_line_loss() {
+  const int fullTurnTime = 300; 
+  unsigned long startTime = millis();
+   
+  SetSpeeds(-80, 80); 
+
+  while (true) {
+    trs.readLine(sensorValues);
+    bool onLine = false;
+
+
+      for(int i = 0; i< 5;i++)
+      {
+         if(sensorValues[i] > 600)
+         onLine = true;
+         
+      }
+    // if(sensorValues[0] > 500 || sensorValues[1] > 500 || sensorValues[2] > 500 || sensorValues[3] > 500 || sensorValues[4] > 500)
+    //   {
+    //     onLine = true;
+        
+    //   }
+
+    if (onLine) {
+      unsigned long elapsed = millis() - startTime;
+      float angle = ((float)elapsed/(float)fullTurnTime)* 180.0;
+      SetSpeeds(80, -80);
+      
+      if (angle < 90 ) {
+
+       //turn('L');
+        SetSpeeds(-20, 20);
+       //delay(10);
+
+      } else if (angle > 90 ) {
+        
+       //turn('R');
+       SetSpeeds(20,-20);
+       //delay(10);
+
+      }
+      break;
+    }
+
+ 
+  }
+}
+
+void turn(unsigned char dir) {
+  switch(dir) {
+    case 'L':
+      // Turn left (90 degrees counter-clockwise)
+      SetSpeeds(-80, 80);
+      delay(150);
+      pledge_counter -= 1; 
+      //update_compass(-80, 80);// Decrement for left turn
+      break;
+    case 'R':
+      // Turn right (90 degrees clockwise)
+      SetSpeeds(80, -80);
+      delay(150);
+      pledge_counter += 1; 
+      //update_compass(80, -80);// Increment for right turn
+      break;
+    case 'B':
+      // Turn around (180 degrees)
+      //SetSpeeds(-80, 80);
+      //delay(300);
+      recover_from_line_loss();
+      break;
+    case 'S':
+      // Don't do anything for straight!
+      break;
+  }
+  
+  SetSpeeds(0, 0);
+  delay(60);
+  
+  // Update compass after turn
+ // update_compass(0, 0);
+  
+  Serial.print("Turn: ");
+  Serial.print(dir);
+  Serial.print(", Pledge Counter: ");
+  Serial.print(pledge_counter);
+  Serial.print(", Compass: ");
+  Serial.print(get_compass_direction());
+  Serial.print(", Facing Initial: ");
+  Serial.println(facing_initial_direction() ? "YES" : "NO");
+  
+  lasttime = millis();   
+}
+
+unsigned long timeStamp = 0;
+unsigned long lastTimePassed = 0;
+
+int timeStepHasPassed()
+{
+  unsigned long timeStep = 15000;
+  unsigned long currentTimePass = millis();
+  if((lastTimePassed - currentTimePass) > timeStep)
+  {
+    lastTimePassed = millis();
+    return 1;
+  }
+}
+
+
+
+unsigned char select_turn_pledge(unsigned char found_left, unsigned char found_straight, unsigned char found_right) {
+  // CORRECTED PLEDGE'S ALGORITHM
+  int direction = 1;
+
+  if(timeStepHasPassed())
+  {
+    //direction = !direction;
+  }
+
+  if(direction)
+  {
+    if (found_right) {
+    return 'R';
+  } else if (found_straight) {
+    return 'S';
+  } else if (found_left) {
+    return 'L';
+  } else {
+    return 'B'; // U-turn
+  }
+  }
+  else
+  {
+    if (found_left) {
+    return 'L';
+  } else if (found_straight) {
+    return 'S';
+  } else if (found_right) {
+    return 'R';
+  } else {
+    return 'B'; // U-turn
+  }
+  }
+  
+
+  // If counter is 0 AND we're facing the initial direction AND straight is available
+  /*if (/*pledge_counter == 0 && facing_initial_direction() && found_straight) {
+    return 'S';  //Continue in original direction
+  }
+  
+  else if(get_compass_direction() == 1 && found_left)
+  {
+    return 'L';
+  }else if(get_compass_direction() == 3 && found_right)
+  {
+    return 'R';
+  }*/
+
+  // Otherwise, follow right-hand wall following rule
+  
+}
+
+int exit_counter = 0;
+
+void loop() {
+  while (!found_exit) {
+    // Update compass continuously
+    //update_compass(last_left_pwm, last_right_pwm);
+    timeStamp = millis();
+    
+    follow_segment();
+    
+    // Detect available paths
+    unsigned char found_left = 0;
+    unsigned char found_straight = 0;
+    unsigned char found_right = 0;
+    
+    trs.readLine(sensorValues);
+    if (sensorValues[0] > 600) found_left = 1;
+    if (sensorValues[4] > 600) found_right = 1;
+    
+    SetSpeeds(10, 10);
+    delay(50);
+    
+    trs.readLine(sensorValues);
+    if (sensorValues[1] > 600 || sensorValues[2] > 600 || sensorValues[3] > 600)
+      found_straight = 1;
+    
+    // Exit detection
+    if (sensorValues[1] > 600 && sensorValues[2] > 600 && sensorValues[3] > 600 &&  
+        sensorValues[0] > 600 && sensorValues[4] > 600) {
+      exit_counter++;
+    }
+    else
+    {
+      //exit_counter = 0;
+    }
+    
+    if(exit_counter >= 15) {
+      found_exit = 1;
+      exit_counter = 0;
+      break;
+    }
+    
+    // Use corrected Pledge's algorithm
+    unsigned char dir = select_turn_pledge(found_left, found_straight, found_right);
+    
+    turn(dir);
+  }
+  
+  // Solved the maze!
+  if(found_exit) {
+    SetSpeeds(0,0);
+    Serial.println("MAZE SOLVED!");
+  }
+}
+
+void PCF8574Write(byte data) {
+  Wire.beginTransmission(Addr);
+  Wire.write(data);
+  Wire.endTransmission(); 
+}
+
+byte PCF8574Read() {
+  int data = -1;
+  Wire.requestFrom(Addr, 1);
+  if(Wire.available()) {
+    data = Wire.read();
+  }
+  return data;
+}
